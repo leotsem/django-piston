@@ -17,7 +17,7 @@ class CORSResource(Resource):
 
 	# headers sent in pre-flight responses
 	preflight_headers = cors_headers + [
-		('Access-Control-Allow-Methods',    'GET'),
+		('Access-Control-Allow-Methods',    '*'),
 		('Access-Control-Allow-Credentials','true')
 	]
 
