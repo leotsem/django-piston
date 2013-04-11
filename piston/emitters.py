@@ -22,13 +22,22 @@ except NameError:
 
 from django.db.models.query import QuerySet
 from django.db.models import Model, permalink
-from django.utils import simplejson
 from django.utils.xmlutils import SimplerXMLGenerator
 from django.utils.encoding import smart_unicode
 from django.core.urlresolvers import reverse, NoReverseMatch
 from django.core.serializers.json import DateTimeAwareJSONEncoder
 from django.http import HttpResponse
 from django.core import serializers
+
+import django
+if django.VERSION >= (1, 5):
+    # In 1.5 and later, DateTimeAwareJSONEncoder inherits from json.JSONEncoder,
+    # while in 1.4 and earlier it inherits from simplejson.JSONEncoder.  The two
+    # are not compatible due to keyword argument namedtuple_as_object, and we
+    # have to ensure that the 'dumps' function we use is the right one.
+    import json
+else:
+    from django.utils import simplejson as json
 
 from utils import HttpStatusCode, Mimer
 from validate_jsonp import is_valid_jsonp_callback_value
@@ -385,13 +394,13 @@ class JSONEmitter(Emitter):
     JSON emitter, understands timestamps.
     """
     def render(self, request):
-        seria = simplejson.dumps(self.construct(), cls=DateTimeAwareJSONEncoder, ensure_ascii=False, indent=4)
+        seria = json.dumps(self.construct(), cls=DateTimeAwareJSONEncoder, ensure_ascii=False, indent=4)
 
         return seria
 
 Emitter.register('json', JSONEmitter, 'application/json; charset=utf-8')
 # Our json decoder should handle empty data by returning None, not raising a decode exception.
-Mimer.register(lambda s: s and simplejson.loads(s) or None, ('application/json',))
+Mimer.register(lambda s: s and json.loads(s) or None, ('application/json',))
 
 class JSONPEmitter(Emitter):
     """
@@ -401,7 +410,7 @@ class JSONPEmitter(Emitter):
 
     def render(self, request):
         cb = request.GET.get('callback', None)
-        seria = simplejson.dumps(self.construct(), cls=DateTimeAwareJSONEncoder, ensure_ascii=False, indent=4)
+        seria = json.dumps(self.construct(), cls=DateTimeAwareJSONEncoder, ensure_ascii=False, indent=4)
 
         # Callback
         if cb and is_valid_jsonp_callback_value(cb):
@@ -410,6 +419,7 @@ class JSONPEmitter(Emitter):
         return seria
 
 Emitter.register('jsonp', JSONPEmitter, 'application/jsonp; charset=utf-8')
+Mimer.register(json.loads, ('application/json',))
 
 class YAMLEmitter(Emitter):
     """
