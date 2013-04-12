@@ -1,5 +1,6 @@
 import sys, inspect
 
+import django
 from django.http import (HttpResponse, Http404, HttpResponseNotAllowed,
     HttpResponseForbidden, HttpResponseServerError)
 from django.views.debug import ExceptionReporter
@@ -10,85 +11,13 @@ from django.db.models.query import QuerySet
 from django.http import Http404
 
 from emitters import Emitter
-from handler import typemapper, BaseHandler
+from handler import typemapper
 from doc import HandlerMethod
 from authentication import NoAuthentication
 from utils import coerce_put_post, FormValidationError, HttpStatusCode
 from utils import rc, format_error, translate_mime, MimerDataException
 
 CHALLENGE = object()
-
-class PistonException(Exception):
-    def __init__(self, status_code, message, headers=None):
-        self.status_code = status_code
-        self.message = message
-        self.headers = headers and headers or {}
-
-    def __unicode__(self):
-        return self.message
-
-class PistonBadRequestException(PistonException):
-    status_code = 400
-    message = 'Malformed or syntactically incorrect request'
-
-    def __init__(self, message=None, headers=None):
-        message = message or self.message
-        super(PistonBadRequestException, self).__init__(self.status_code, message, headers)
-
-class PistonUnauthorizedException(PistonException):
-    status_code = 401
-    message = 'Request requires authentication'
-
-    def __init__(self, message=None, headers=None):
-        message = message or self.message
-        super(PistonUnauthorizedException, self).__init__(self.status_code, message, headers)
-
-class PistonForbiddenException(PistonException):
-    status_code = 403
-    message = 'Request of specified resource is forbidden'
-
-    def __init__(self, message=None, headers=None):
-        message = message or self.message
-        super(PistonForbiddenException, self).__init__(self.status_code, message, headers)
-
-class PistonNotFoundException(PistonException):
-    status_code = 404
-    message = 'Requested resource could not be located'
-    def __init__(self, message=None, headers=None):
-        message = message or self.message
-        super(PistonNotFoundException, self).__init__(self.status_code, message, headers)
-
-class PistonMethodException(PistonException):
-    status_code = 405
-    message = 'Method not allowed on requested resource'
-    def __init__(self, message=None, headers=None):
-        message = message or self.message
-        super(PistonMethodException, self).__init__(self.status_code, message, headers)
-
-class Response(object):
-    def __init__(self):
-        self.status_code = 200
-        self.error_code = None
-        self.error_message = ''
-        self.form_errors = {}
-        self.data = None
-        self.headers = {}
-
-    def transform_data(self):
-        if self.error_message:
-            return self.error_message
-        else:
-            return self.data
-
-class EnhancedResponse(Response):
-    def transform_data(self):
-        return {
-                'status_code': self.status_code,
-                'error_code': self.error_code,
-                'error_message': self.error_message,
-                'form_errors': self.form_errors,
-                'data': self.data,
-                }
 
 class Resource(object):
     """
@@ -101,11 +30,10 @@ class Resource(object):
     callmap = { 'GET': 'read', 'POST': 'create',
                 'PUT': 'update', 'DELETE': 'delete' }
 
-    def __init__(self, handler, authentication=None, response_class=None):
+    def __init__(self, handler, authentication=None):
         if not callable(handler):
             raise AttributeError, "Handler not callable."
 
-        self.response_class = response_class is not None and response_class or Response
         self.handler = handler()
         self.csrf_exempt = getattr(self.handler, 'csrf_exempt', True)
 
@@ -119,7 +47,6 @@ class Resource(object):
         # Erroring
         self.email_errors = getattr(settings, 'PISTON_EMAIL_ERRORS', True)
         self.display_errors = getattr(settings, 'PISTON_DISPLAY_ERRORS', True)
-        self.display_traceback = getattr(settings, 'PISTON_DISPLAY_TRACEBACK', False)
         self.stream = getattr(settings, 'PISTON_STREAM_OUTPUT', False)
 
     def determine_emitter(self, request, *args, **kwargs):
@@ -139,6 +66,15 @@ class Resource(object):
 
         return em
 
+    def form_validation_response(self, e):
+        """
+        Method to return form validation error information.
+        You will probably want to override this in your own
+        `Resource` subclass.
+        """
+        resp = rc.BAD_REQUEST
+        resp.write(' '+str(e.form.errors))
+        return resp
 
     @property
     def anonymous(self):
@@ -176,45 +112,86 @@ class Resource(object):
 
         return actor, anonymous
 
-
     @vary_on_headers('Authorization')
     def __call__(self, request, *args, **kwargs):
+        """
+        NB: Sends a `Vary` header so we don't cache requests
+        that are different (OAuth stuff in `Authorization` header.)
+        """
+        rm = request.method.upper()
+
+        # Django's internal mechanism doesn't pick up
+        # PUT request, so we trick it a little here.
+        if rm == "PUT":
+            coerce_put_post(request)
+
+        actor, anonymous = self.authenticate(request, rm)
+
+        if anonymous is CHALLENGE:
+            return actor()
+        else:
+            handler = actor
+
+        # Translate nested datastructs into `request.data` here.
+        if rm in ('POST', 'PUT'):
+            try:
+                translate_mime(request)
+            except MimerDataException:
+                return rc.BAD_REQUEST
+            if not hasattr(request, 'data'):
+                if rm == 'POST':
+                    request.data = request.POST
+                else:
+                    request.data = request.PUT
+
+        if not rm in handler.allowed_methods:
+            return HttpResponseNotAllowed(handler.allowed_methods)
+
+        meth = getattr(handler, self.callmap.get(rm, ''), None)
+        if not meth:
+            raise Http404
+
         # Support emitter both through (?P<emitter_format>) and ?format=emitter.
         em_format = self.determine_emitter(request, *args, **kwargs)
+
         kwargs.pop('emitter_format', None)
 
-        response = self.response_class()
+        # Clean up the request object a bit, since we might
+        # very well have `oauth_`-headers in there, and we
+        # don't want to pass these along to the handler.
+        request = self.cleanup_request(request)
+
+        try:
+            result = meth(request, *args, **kwargs)
+        except Exception, e:
+            result = self.error_handler(e, request, meth, em_format)
 
         try:
             emitter, ct = Emitter.get(em_format)
-        except ValueError:
-            raise PistonBadRequestException("Invalid output format specified '%s'." % em_format)
+            fields = handler.fields
 
-        if not response.error_message:
-            meth = None
-            try:
-                handler, meth, fields, anonymous = self.process_request(request, response, *args, **kwargs)
-            except Exception, e:
-                handler, meth, fields, anonymous = None, None, (), False
-                self.error_handler(response, e, request, meth)
+            if hasattr(handler, 'list_fields') and isinstance(result, (list, tuple, QuerySet)):
+                fields = handler.list_fields
+        except ValueError:
+            result = rc.BAD_REQUEST
+            result.content = "Invalid output format specified '%s'." % em_format
+            return result
+
+        status_code = 200
 
         # If we're looking at a response object which contains non-string
         # content, then assume we should use the emitter to format that
         # content
-        if isinstance(response.data, HttpResponse) and not response.data._is_string:
-            # TODO: fix this
-            response.status_code = response.data.status_code
-            # Note: We can't use result.content here because that method attempts
-            # to convert the content into a string which we don't want.
-            # when _is_string is False _container is the raw data
-            response.data = response.data._container
+        if self._use_emitter(result):
+            status_code = result.status_code
+            # Note: We can't use result.content here because that
+            # method attempts to convert the content into a string
+            # which we don't want.  when
+            # _is_string/_base_content_is_iter is False _container is
+            # the raw data
+            result = result._container
 
-        data = response.transform_data()
-        srl = emitter(data, typemapper, handler, fields, anonymous)
-
-        status_code = response.status_code
-        if srl.ALWAYS_200_OK:
-            status_code = 200
+        srl = emitter(result, typemapper, handler, fields, anonymous)
 
         try:
             """
@@ -237,80 +214,15 @@ class Resource(object):
         except HttpStatusCode, e:
             return e.response
 
-    def process_request(self, request, response, *args, **kwargs):
-        """
-        NB: Sends a `Vary` header so we don't cache requests
-        that are different (OAuth stuff in `Authorization` header.)
-        """
-        rm = request.method.upper()
-
-        # Django's internal mechanism doesn't pick up
-        # on non POST request, so we trick it a little here.
-        if rm in ("PUT", "DELETE",):
-            coerce_put_post(request)
-
-        actor, anonymous = self.authenticate(request, rm)
-
-        result = None
-        if anonymous is CHALLENGE:
-            class ErrorHandler(BaseHandler):
-                def error(self, *args, **kwargs):
-                    pass
-
-            for func in self.callmap.values():
-                setattr(ErrorHandler, func, ErrorHandler.error)
-
-            handler = ErrorHandler()
-            meth = handler.error
-            fields = ()
-            response.data = actor(request)
+    @staticmethod
+    def _use_emitter(result):
+        """True iff result is a HttpResponse and contains non-string content."""
+        if not isinstance(result, HttpResponse):
+            return False
+        elif django.VERSION >= (1, 4):
+            return not result._base_content_is_iter
         else:
-            handler = actor
-            meth = None
-            fields = ()
-
-        if not response.data:
-            # Translate nested datastructs into `request.data` here.
-            if rm in ('POST', 'PUT', 'DELETE',):
-                try:
-                    translate_mime(request)
-                except MimerDataException:
-                    raise PistonBadRequestException('Error deserializing request data.')
-                if not hasattr(request, 'data'):
-                    if rm == 'POST':
-                        request.data = request.POST
-                    elif rm == 'PUT':
-                        request.data = request.PUT
-                    elif rm == 'DELETE':
-                        request.data = request.DELETE
-
-                if not request.data:
-                    # In the case where no data is provided, default to an empty
-                    # dictionary. Many serializers do not deal with empty string data
-                    # for deserialization.
-                    setattr(request, rm, {})
-                    request.data = {}
-
-            if not rm in handler.allowed_methods:
-                raise PistonMethodException(headers={'Allow': handler.allowed_methods})
-
-            meth = getattr(handler, self.callmap.get(rm, ''), None)
-            if not meth:
-                raise PistonNotFoundException
-
-            # Clean up the request object a bit, since we might
-            # very well have `oauth_`-headers in there, and we
-            # don't want to pass these along to the handler.
-            request = self.cleanup_request(request)
-
-            response.data = meth(request, *args, **kwargs)
-
-            fields = handler.fields
-
-            if hasattr(handler, 'list_fields') and isinstance(response.data, (list, tuple, QuerySet)):
-                fields = handler.list_fields
-
-        return handler, meth, fields, anonymous
+            return result._is_string
 
     @staticmethod
     def cleanup_request(request):
@@ -338,7 +250,7 @@ class Resource(object):
         subject = "Piston crash report"
         html = reporter.get_traceback_html()
 
-        message = EmailMessage(settings.EMAIL_SUBJECT_PREFIX + subject,
+        message = EmailMessage(settings.EMAIL_SUBJECT_PREFIX+subject,
                                 html, settings.SERVER_EMAIL,
                                 [ admin[1] for admin in settings.ADMINS ])
 
@@ -346,20 +258,16 @@ class Resource(object):
         message.send(fail_silently=True)
 
 
-    def error_handler(self, response, e, request, meth):
+    def error_handler(self, e, request, meth, em_format):
         """
         Override this method to add handling of errors customized for your
         needs
         """
-        response.status_code = 500
-        if isinstance(e, (PistonException, PistonBadRequestException, PistonForbiddenException, PistonMethodException, PistonNotFoundException, PistonUnauthorizedException)):
-            response.status_code = e.status_code
-            response.error_message = e.message
-            response.headers.update(e.headers)
-        elif isinstance(e, FormValidationError):
-            response.status_code = 400
-            response.form_errors = e.form.errors
-        elif isinstance(e, TypeError) and meth:
+        if isinstance(e, FormValidationError):
+            return self.form_validation_response(e)
+
+        elif isinstance(e, TypeError):
+            result = rc.BAD_REQUEST
             hm = HandlerMethod(meth)
             sig = hm.signature
 
@@ -373,13 +281,14 @@ class Resource(object):
             if self.display_errors:
                 msg += '\n\nException was: %s' % str(e)
 
-            response.error_message = format_error(msg)
-        # TODO: As we start using Piston exceptions, the following 2 errors can be phased out
+            result.content = format_error(msg)
+            return result
         elif isinstance(e, Http404):
-            response.status_code = 404
-            response.error_message = 'Not Found'
+            return rc.NOT_FOUND
+
         elif isinstance(e, HttpStatusCode):
-            response.error_message = e.response
+            return e.response
+
         else:
             """
             On errors (like code errors), we'd like to be able to
@@ -389,8 +298,7 @@ class Resource(object):
             Parameters::
              - `PISTON_EMAIL_ERRORS`: Will send a Django formatted
                error email to people in `settings.ADMINS`.
-             - `PISTON_DISPLAY_ERRORS`: Will return a simple message/full traceback
-               depending on `PISTON_DISPLAY_TRACEBACK`. Default is simple message
+             - `PISTON_DISPLAY_ERRORS`: Will return a simple traceback
                to the caller, so he can tell you what error they got.
 
             If `PISTON_DISPLAY_ERRORS` is not enabled, the caller will
@@ -401,9 +309,7 @@ class Resource(object):
             if self.email_errors:
                 self.email_exception(rep)
             if self.display_errors:
-                if self.display_traceback:
-                    response.error_message = format_error('\n'.join(rep.format_exception()))
-                else:
-                    response.error_message = str(e)
+                return HttpResponseServerError(
+                    format_error('\n'.join(rep.format_exception())))
             else:
                 raise

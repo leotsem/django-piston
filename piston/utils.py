@@ -12,7 +12,7 @@ from django.core.mail import send_mail, mail_admins
 from django.http import HttpResponseNotAllowed, HttpResponseForbidden, HttpResponse, HttpResponseBadRequest
 from django.template import loader, TemplateDoesNotExist
 from django.utils.translation import ugettext as _
-
+import django
 
 __version__ = '0.2.3rc1'
 
@@ -50,30 +50,41 @@ class rc_factory(object):
         except TypeError:
             raise AttributeError(attr)
 
-        class HttpResponseWrapper(HttpResponse):
-            """
-            Wrap HttpResponse and make sure that the internal _is_string
-            flag is updated when the _set_content method (via the content
-            property) is called
-            """
-            def _set_content(self, content):
+        if django.VERSION < (1, 4):
+            class HttpResponseWrapper(HttpResponse):
                 """
-                Set the _container and _is_string properties based on the
-                type of the value parameter. This logic is in the construtor
-                for HttpResponse, but doesn't get repeated when setting
-                HttpResponse.content although this bug report (feature request)
-                suggests that it should: http://code.djangoproject.com/ticket/9403
+                Wrap HttpResponse and make sure that the internal
+                _is_string/_base_content_is_iter flag is updated when the
+                _set_content method (via the content property) is called
                 """
-                if not isinstance(content, basestring) and hasattr(content, '__iter__'):
-                    self._container = content
-                    self._is_string = False
-                else:
-                    self._container = [content]
-                    self._is_string = True
+                def _set_content(self, content):
+                    """
+                    Set the _container and _is_string /
+                    _base_content_is_iter properties based on the type of
+                    the value parameter. This logic is in the construtor
+                    for HttpResponse, but doesn't get repeated when
+                    setting HttpResponse.content although this bug report
+                    (feature request) suggests that it should:
+                    http://code.djangoproject.com/ticket/9403
 
-            content = property(HttpResponse._get_content, _set_content)
+                    #9403 was fixed by #16494 in 1.4 alpha.
+                    """
+                    is_string = False
+                    if not isinstance(content, basestring) and hasattr(content, '__iter__'):
+                        self._container = content
+                    else:
+                        self._container = [content]
+                        is_string = True
+                    if django.VERSION >= (1, 4):
+                        self._base_content_is_iter = not is_string
+                    else:
+                        self._is_string = is_string
 
-        return HttpResponseWrapper(r, content_type='text/plain', status=c)
+                content = property(HttpResponse._get_content, _set_content)
+
+            return HttpResponseWrapper(r, content_type='text/plain', status=c)
+        else:
+            return HttpResponse(r, content_type='text/plain', status=c)
 
 rc = rc_factory()
 
