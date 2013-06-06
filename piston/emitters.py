@@ -25,7 +25,7 @@ from django.db.models import Model, permalink
 from django.utils.xmlutils import SimplerXMLGenerator
 from django.utils.encoding import smart_unicode
 from django.core.urlresolvers import reverse, NoReverseMatch
-from django.core.serializers.json import DateTimeAwareJSONEncoder
+from json_encoder import DateCompatibleJSONEncoder
 from django.http import HttpResponse
 from django.core import serializers
 
@@ -394,7 +394,7 @@ class JSONEmitter(Emitter):
     JSON emitter, understands timestamps.
     """
     def render(self, request):
-        seria = json.dumps(self.construct(), cls=DateTimeAwareJSONEncoder, ensure_ascii=False, indent=4)
+        seria = json.dumps(self.construct(), cls=DateCompatibleJSONEncoder, ensure_ascii=False, indent=4)
 
         return seria
 
@@ -410,7 +410,7 @@ class JSONPEmitter(Emitter):
 
     def render(self, request):
         cb = request.GET.get('callback', None)
-        seria = json.dumps(self.construct(), cls=DateTimeAwareJSONEncoder, ensure_ascii=False, indent=4)
+        seria = json.dumps(self.construct(), cls=DateCompatibleJSONEncoder, ensure_ascii=False, indent=4)
 
         # Callback
         if cb and is_valid_jsonp_callback_value(cb):
