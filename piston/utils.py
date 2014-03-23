@@ -292,7 +292,8 @@ class Mimer(object):
                     self.request.POST = self.request.PUT = dict()
                 except (TypeError, ValueError):
                     # This also catches if loadee is None.
-                    raise MimerDataException
+                    # Mute exception to avoid inacccurate exceptions when using POST with empty body
+                    pass
             else:
                 self.request.data = None
 
